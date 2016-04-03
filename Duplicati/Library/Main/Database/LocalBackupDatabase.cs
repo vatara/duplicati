@@ -67,6 +67,7 @@ namespace Duplicati.Library.Main.Database
         private readonly System.Data.IDbCommand m_findmetadatasetCommand;
 
         private readonly System.Data.IDbCommand m_insertblockCommand;
+        private readonly System.Data.IDbCommand m_insertorignoreblockCommand;
 
         private readonly System.Data.IDbCommand m_insertfileCommand;
 
@@ -103,6 +104,7 @@ namespace Duplicati.Library.Main.Database
         {
             m_findblockCommand = m_connection.CreateCommand();
             m_insertblockCommand = m_connection.CreateCommand();
+            m_insertorignoreblockCommand = m_connection.CreateCommand();
             m_insertfileCommand = m_connection.CreateCommand();
             m_insertblocksetCommand = m_connection.CreateCommand();
             m_insertmetadatasetCommand = m_connection.CreateCommand();
@@ -131,6 +133,9 @@ namespace Duplicati.Library.Main.Database
 
             m_insertblockCommand.CommandText = @"INSERT INTO ""Block"" (""Hash"", ""VolumeID"", ""Size"") VALUES (?, ?, ?); SELECT last_insert_rowid();";
             m_insertblockCommand.AddParameters(3);
+
+            m_insertorignoreblockCommand.CommandText = @"INSERT OR IGNORE INTO ""Block"" (""Hash"", ""VolumeID"", ""Size"") VALUES (?, ?, ?);";
+            m_insertorignoreblockCommand.AddParameters(3);
 
             m_insertfileOperationCommand.CommandText = @"INSERT INTO ""FilesetEntry"" (""FilesetID"", ""FileID"", ""Lastmodified"") VALUES (?, ?, ?)";
             m_insertfileOperationCommand.AddParameters(3);
@@ -303,6 +308,16 @@ namespace Duplicati.Library.Main.Database
         /// <returns>True if the block should be added to the current output</returns>
         public bool AddBlock (string key, long size, long volumeid, System.Data.IDbTransaction transaction = null)
         {
+            if (m_blockHashLookup == null)
+            {
+                m_insertorignoreblockCommand.Transaction = transaction;
+                m_insertorignoreblockCommand.SetParameterValue(0, key);
+                m_insertorignoreblockCommand.SetParameterValue(1, volumeid);
+                m_insertorignoreblockCommand.SetParameterValue(2, size);
+                var c = m_insertorignoreblockCommand.ExecuteNonQuery();
+                return c == 1;
+            }
+
             var r = -1L;
             if (m_blockHashLookup != null) 
             {
