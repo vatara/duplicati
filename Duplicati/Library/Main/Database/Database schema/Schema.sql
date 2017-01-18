@@ -1,7 +1,7 @@
 ﻿/*
 Syntax notes (Applying to schema.sql and versioning x.*.sql files):
 Be careful with semicolons, it is used as a simple Split-point for statements.
-For conditional schema statements, a preprocesossor exists. Example:
+For conditional schema statements, a preprocessor exists. Example:
 {#if sqlite_version >= 3.8.2} DO_SOMETHING {#else} DO_SOMETHING_ELSE {#endif}
 Variables available: sqlite_version (type Version) and db_version (type int)
 Nesting is possible when appending a number in the form "_x" to the #if #else #endif.
@@ -107,8 +107,10 @@ and ordered by the index
 CREATE TABLE "BlocklistHash" (
 	"BlocksetID" INTEGER NOT NULL,
 	"Index" INTEGER NOT NULL,
-	"Hash" TEXT NOT NULL
+	"Hash" TEXT NOT NULL,
+    CONSTRAINT "BlocksetListHash_PK_IdIndex" PRIMARY KEY ("BlocksetID", "Index")
 );
+
 
 /*
 The blockset is a list of blocks
@@ -241,4 +243,4 @@ CREATE TABLE "Configuration" (
 	"Value" TEXT NOT NULL
 );
 
-INSERT INTO "Version" ("Version") VALUES (6);
+INSERT INTO "Version" ("Version") VALUES (7);
