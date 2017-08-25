@@ -173,6 +173,18 @@ namespace Duplicati.Library.Main
             m_messageSink = messageSink;
         }
 
+        /// <summary>
+        /// Appends another message sink to the controller
+        /// </summary>
+        /// <param name="sink">The sink to use.</param>
+        public void AppendSink(IMessageSink sink)
+        {
+            if (m_messageSink is MultiMessageSink)
+                ((MultiMessageSink)m_messageSink).Append(sink);
+            else
+                m_messageSink = new MultiMessageSink(m_messageSink, sink);
+        }
+
         public Duplicati.Library.Interface.IBackupResults Backup(string[] inputsources, IFilter filter = null)
         {
             Library.UsageReporter.Reporter.Report("USE_BACKEND", new Library.Utility.Uri(m_backend).Scheme);
@@ -388,24 +400,27 @@ namespace Duplicati.Library.Main
             });
         }
 
-        public Duplicati.Library.Interface.IListChangesResults ListChanges(string baseVersion, string targetVersion, IEnumerable<string> filterstrings = null, Library.Utility.IFilter filter = null)
+        public Duplicati.Library.Interface.IListChangesResults ListChanges(string baseVersion, string targetVersion, IEnumerable<string> filterstrings = null, Library.Utility.IFilter filter = null, Action<Duplicati.Library.Interface.IListChangesResults, IEnumerable<Tuple<Library.Interface.ListChangesChangeType, Library.Interface.ListChangesElementType, string>>> callback = null)
         {
             var t = new string[] { baseVersion, targetVersion };
 
             return RunAction(new ListChangesResults(), ref t, ref filter, (result) => {
-                new Operation.ListChangesHandler(m_backend, m_options, result).Run(t[0], t[1], filterstrings, filter);
+                new Operation.ListChangesHandler(m_backend, m_options, result).Run(t[0], t[1], filterstrings, filter, callback);
             });
         }
 
-        public Duplicati.Library.Interface.IListAffectedResults ListAffected(List<string> args)
+        public Duplicati.Library.Interface.IListAffectedResults ListAffected(List<string> args, Action<Duplicati.Library.Interface.IListAffectedResults> callback = null)
         {
             return RunAction(new ListAffectedResults(), (result) => {
-                new Operation.ListAffected(m_options, result).Run(args);
+                new Operation.ListAffected(m_options, result).Run(args, callback);
             });
         }
 
         public Duplicati.Library.Interface.ITestResults Test(long samples = 1)
         {
+            if (!m_options.RawOptions.ContainsKey("full-remote-verification"))
+                m_options.RawOptions["full-remote-verification"] = "true";
+                
             return RunAction(new TestResults(), (result) => {
                 new Operation.TestHandler(m_backend, m_options, result).Run(samples);
             });
@@ -478,6 +493,13 @@ namespace Duplicati.Library.Main
             {
                 result.Lines = new string[0];
                 System.Threading.Thread.Sleep(5);
+            });
+        }
+
+        public Library.Interface.IVacuumResults Vacuum()
+        {
+            return RunAction(new VacuumResult(), result => {
+                new Operation.VacuumHandler(m_options, result).Run();
             });
         }
 
@@ -656,13 +678,15 @@ namespace Duplicati.Library.Main
             foreach (Library.Interface.IGenericModule m in DynamicLoader.GenericLoader.Modules)
                 m_options.LoadedModules.Add(new KeyValuePair<bool, Library.Interface.IGenericModule>(Array.IndexOf<string>(m_options.DisableModules, m.Key.ToLower()) < 0 && (m.LoadAsDefault || Array.IndexOf<string>(m_options.EnableModules, m.Key.ToLower()) >= 0), m));
 
+            // Make the filter read-n-write able in the generic modules
+            var pristinefilter = string.Join(System.IO.Path.PathSeparator.ToString(), FilterExpression.Serialize(filter));
+            m_options.RawOptions["filter"] = pristinefilter;
+            
+            // Store the URL connection options separately, as these should only be visible to modules implementing IConnectionModule
             var conopts = new Dictionary<string, string>(m_options.RawOptions);
             var qp = new Library.Utility.Uri(m_backend).QueryParameters;
-            foreach(var k in qp.Keys)
+            foreach (var k in qp.Keys)
                 conopts[(string)k] = qp[(string)k];
-
-            // Make the filter read-n-write able in the generic modules
-            var pristinefilter = conopts["filter"] = string.Join(System.IO.Path.PathSeparator.ToString(), FilterExpression.Serialize(filter));
 
             foreach (var mx in m_options.LoadedModules)
                 if (mx.Key)
@@ -689,9 +713,12 @@ namespace Duplicati.Library.Main
                         ((Library.Interface.IGenericCallbackModule)mx.Value).OnStart(result.MainOperation.ToString(), ref m_backend, ref paths);
                 }
 
-            // If the filters were changed, read them back in
-            if (pristinefilter != conopts["filter"])
-                filter = FilterExpression.Deserialize(pristinefilter.Split(new string[] {System.IO.Path.PathSeparator.ToString()}, StringSplitOptions.RemoveEmptyEntries));
+            // If the filters were changed by a module, read them back in
+            if (pristinefilter != m_options.RawOptions["filter"])
+            {
+                filter = FilterExpression.Deserialize(m_options.RawOptions["filter"].Split(new string[] { System.IO.Path.PathSeparator.ToString() }, StringSplitOptions.RemoveEmptyEntries));
+            }
+            m_options.RawOptions.Remove("filter"); // "--filter" is not a supported command line option
 
             OperationRunning(true);
 
@@ -761,13 +788,14 @@ namespace Duplicati.Library.Main
         /// This function will examine all options passed on the commandline, and test for unsupported or deprecated values.
         /// Any errors will be logged into the statistics module.
         /// </summary>
-        /// <param name="options">The commandline options given</param>
-        /// <param name="backend">The backend url</param>
-        /// <param name="stats">The statistics into which warnings are written</param>
+        /// <param name="log">The log instance</param>
         private void ValidateOptions(ILogWriter log)
         {
             if (m_options.KeepTime.Ticks > 0 && m_options.KeepVersions > 0)
-                throw new Exception(string.Format("Setting both --{0} and --{1} is not permitted", "keep-versions", "keep-time"));
+                throw new Interface.UserInformationException(string.Format("Setting both --{0} and --{1} is not permitted", "keep-versions", "keep-time"));
+
+            if (!string.IsNullOrWhiteSpace(m_options.Prefix) && m_options.Prefix.Contains("-"))
+                throw new Interface.UserInformationException("The prefix cannot contain hyphens (-)");
 
             //No point in going through with this if we can't report
             if (log == null)
@@ -996,9 +1024,21 @@ namespace Duplicati.Library.Main
                 t.Abort();
         }
 
-        #region IDisposable Members
+        public long MaxUploadSpeed
+        {
+            get { return m_options.MaxUploadPrSecond; }
+            set { m_options.MaxUploadPrSecond = value; }
+        }
 
-        public void Dispose()
+		public long MaxDownloadSpeed
+		{
+			get { return m_options.MaxDownloadPrSecond; }
+			set { m_options.MaxDownloadPrSecond = value; }
+		}
+
+		#region IDisposable Members
+
+		public void Dispose()
         {
         }
 

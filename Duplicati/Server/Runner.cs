@@ -33,6 +33,8 @@ namespace Duplicati.Server
             void Abort();
             void Pause();
             void Resume();
+            void UpdateThrottleSpeed();
+            void SetController(Duplicati.Library.Main.Controller controller);
         }
         
         private class RunnerData : IRunnerData
@@ -48,7 +50,12 @@ namespace Duplicati.Server
             public long TaskID { get { return m_taskID; } }
             
             internal Duplicati.Library.Main.Controller Controller { get; set; }
-            
+
+            public void SetController(Duplicati.Library.Main.Controller controller)
+            {
+                Controller = controller;
+            }
+
             public void Stop()
             {
                 var c = Controller;
@@ -76,13 +83,75 @@ namespace Duplicati.Server
                 if (c != null)
                     c.Resume();
             }
-            
+
+            public long OriginalUploadSpeed { get; set; }
+            public long OriginalDownloadSpeed { get; set; }
+
+			public void UpdateThrottleSpeed()
+			{
+				var controller = this.Controller;
+				if (controller == null)
+					return;
+
+				var job_upload_throttle = this.OriginalUploadSpeed <= 0 ? long.MaxValue : this.OriginalUploadSpeed;
+				var job_download_throttle = this.OriginalDownloadSpeed <= 0 ? long.MaxValue : this.OriginalDownloadSpeed;
+
+				var server_upload_throttle = long.MaxValue;
+				var server_download_throttle = long.MaxValue;
+
+				try
+				{
+					if (!string.IsNullOrWhiteSpace(Program.DataConnection.ApplicationSettings.UploadSpeedLimit))
+						server_upload_throttle = Duplicati.Library.Utility.Sizeparser.ParseSize(Program.DataConnection.ApplicationSettings.UploadSpeedLimit, "kb");
+				}
+				catch { }
+
+				try
+				{
+					if (!string.IsNullOrWhiteSpace(Program.DataConnection.ApplicationSettings.DownloadSpeedLimit))
+						server_download_throttle = Duplicati.Library.Utility.Sizeparser.ParseSize(Program.DataConnection.ApplicationSettings.DownloadSpeedLimit, "kb");
+				}
+				catch { }
+
+				var upload_throttle = Math.Min(job_upload_throttle, server_upload_throttle);
+				var download_throttle = Math.Min(job_download_throttle, server_download_throttle);
+
+				if (upload_throttle <= 0 || upload_throttle == long.MaxValue)
+					upload_throttle = 0;
+
+				if (download_throttle <= 0 || download_throttle == long.MaxValue)
+					download_throttle = 0;
+
+				controller.MaxUploadSpeed = upload_throttle;
+				controller.MaxDownloadSpeed = download_throttle;
+			}
+
             private readonly long m_taskID;
             
             public RunnerData()
             {
                 m_taskID = System.Threading.Interlocked.Increment(ref RunnerTaskID);
             }
+        }
+
+        private class CustomRunnerTask : RunnerData
+        {
+            public readonly Action<Library.Main.IMessageSink> Run;
+
+            public CustomRunnerTask(Action<Library.Main.IMessageSink> runner)
+                : base()
+            {
+                if (runner == null)
+                    throw new ArgumentNullException("runner");
+                Run = runner;
+                Operation = DuplicatiOperation.CustomRunner;
+                Backup = new Database.Backup();
+            }
+        }
+
+        public static IRunnerData CreateCustomTask(Action<Library.Main.IMessageSink> runner)
+        {
+            return new CustomRunnerTask(runner);
         }
         
         public static IRunnerData CreateTask(Duplicati.Server.Serialization.DuplicatiOperation operation, Duplicati.Server.Serialization.Interface.IBackup backup, IDictionary<string, string> extraOptions = null, string[] filterStrings = null)
@@ -339,9 +408,65 @@ namespace Duplicati.Server
 
             return cmd.ToString();
         }
+
+        public static string[] GetCommandLineParts(IRunnerData data)
+        {
+            var backup = data.Backup;
+
+            var options = ApplyOptions(backup, data.Operation, GetCommonOptions(backup, data.Operation));
+            if (data.ExtraOptions != null)
+                foreach (var k in data.ExtraOptions)
+                    options[k.Key] = k.Value;
+
+            var cf = Program.DataConnection.Filters;
+            var bf = backup.Filters;
+
+            var sources =
+                (from n in backup.Sources
+                 let p = SpecialFolders.ExpandEnvironmentVariables(n)
+                 where !string.IsNullOrWhiteSpace(p)
+                 select p).ToArray();
+
+            var parts = new List<string>();
+
+            parts.Add(backup.TargetURL);
+            parts.AddRange(sources);
+
+            foreach (var opt in options)
+                parts.Add(string.Format("--{0}={1}", opt.Key, opt.Value));
+
+            if (cf != null)
+                foreach (var f in cf)
+                    parts.Add(string.Format("--{0}={1}", f.Include ? "include" : "exclude", f.Expression));
+
+            if (bf != null)
+                foreach (var f in bf)
+                    parts.Add(string.Format("--{0}={1}", f.Include ? "include" : "exclude", f.Expression));
+
+            return parts.ToArray();
+        }
         
         public static Duplicati.Library.Interface.IBasicResults Run(IRunnerData data, bool fromQueue)
         {
+            if (data is CustomRunnerTask)
+            {
+                try
+                {
+                    var sink = new MessageSink(data.TaskID, null);
+                    Program.GenerateProgressState = () => sink.Copy();
+                    Program.StatusEventNotifyer.SignalNewEvent();
+
+                    ((CustomRunnerTask)data).Run(sink);
+                }
+                catch(Exception ex)
+                {
+                    Program.DataConnection.LogError(string.Empty, "Failed while executing custom task", ex);
+                }
+
+                return null;
+            }
+
+
             var backup = data.Backup;
             Duplicati.Library.Utility.TempFolder tempfolder = null;
 
@@ -350,14 +475,14 @@ namespace Duplicati.Server
             
             try
             {                
-                var options = ApplyOptions(backup, data.Operation, GetCommonOptions(backup, data.Operation));
                 var sink = new MessageSink(data.TaskID, backup.ID);
                 if (fromQueue)
                 {
                     Program.GenerateProgressState = () => sink.Copy();
                     Program.StatusEventNotifyer.SignalNewEvent();            
                 }
-                
+
+                var options = ApplyOptions(backup, data.Operation, GetCommonOptions(backup, data.Operation));                
                 if (data.ExtraOptions != null)
                     foreach(var k in data.ExtraOptions)
                         options[k.Key] = k.Value;                
@@ -406,9 +531,24 @@ namespace Duplicati.Server
                 using(tempfolder)
                 using(var controller = new Duplicati.Library.Main.Controller(backup.TargetURL, options, sink))
                 {
-                    ((RunnerData)data).Controller = controller;
-                    
-                    switch (data.Operation)
+                    try 
+                    {
+                        if (options.ContainsKey("throttle-upload"))
+                            ((RunnerData)data).OriginalUploadSpeed = Duplicati.Library.Utility.Sizeparser.ParseSize(options["throttle-upload"], "kb");
+                    }
+                    catch { }
+
+					try
+					{
+						if (options.ContainsKey("throttle-download"))
+                            ((RunnerData)data).OriginalDownloadSpeed = Duplicati.Library.Utility.Sizeparser.ParseSize(options["throttle-download"], "kb");
+					}
+					catch { }
+
+					((RunnerData)data).Controller = controller;
+                    data.UpdateThrottleSpeed();
+
+					switch (data.Operation)
                     {
                         case DuplicatiOperation.Backup:
                             {
@@ -498,25 +638,30 @@ namespace Duplicati.Server
                                 return r;
                             }
 
-                    case DuplicatiOperation.Delete:
-                        {
-                            if (Library.Utility.Utility.ParseBoolOption(data.ExtraOptions, "delete-remote-files"))
-                                controller.DeleteAllRemoteFiles();
-
-                            if (Library.Utility.Utility.ParseBoolOption(data.ExtraOptions, "delete-local-db"))
+                        case DuplicatiOperation.Delete:
                             {
-                                string dbpath;
-                                options.TryGetValue("db-path", out dbpath);
+                                if (Library.Utility.Utility.ParseBoolOption(data.ExtraOptions, "delete-remote-files"))
+                                    controller.DeleteAllRemoteFiles();
 
-                                if (!string.IsNullOrWhiteSpace(dbpath) && System.IO.File.Exists(dbpath))
-                                    System.IO.File.Delete(dbpath);
+                                if (Library.Utility.Utility.ParseBoolOption(data.ExtraOptions, "delete-local-db"))
+                                {
+                                    string dbpath;
+                                    options.TryGetValue("db-path", out dbpath);
+
+                                    if (!string.IsNullOrWhiteSpace(dbpath) && System.IO.File.Exists(dbpath))
+                                        System.IO.File.Delete(dbpath);
+                                }
+                                Program.DataConnection.DeleteBackup(backup);
+                                Program.Scheduler.Reschedule();
+                                return null;
                             }
-                            Program.DataConnection.DeleteBackup(backup);
-                            Program.Scheduler.Reschedule();
-                            return null;
-                        }
-
-                    default:
+                        case DuplicatiOperation.Vacuum:
+                            {
+                                var r = controller.Vacuum();
+                                UpdateMetadata(backup, r);
+                                return r;
+                            }
+                        default:
                             //TODO: Log this
                             return null;
                     }
@@ -761,6 +906,8 @@ namespace Duplicati.Server
                 select (Duplicati.Library.Utility.IFilter)(new Duplicati.Library.Utility.FilterExpression(exp, n.Include)))
                 .Aggregate((a, b) => Duplicati.Library.Utility.FilterExpression.Combine(a, b));
         }
+
+
     }
 }
 

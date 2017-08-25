@@ -1315,8 +1315,6 @@ ORDER BY
 
                 tr.Commit();
             }
-            using(var cmd = m_connection.CreateCommand())
-                cmd.ExecuteNonQuery("VACUUM");
         }
         
         public virtual void Dispose()
